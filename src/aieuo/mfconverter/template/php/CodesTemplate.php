@@ -14,6 +14,10 @@ class CodesTemplate extends Template {
         $this->codes = $codes;
     }
 
+    public function addLine(string $line): void {
+        $this->codes[] = $line;
+    }
+
     public function getLines(): array {
         return $this->codes;
     }

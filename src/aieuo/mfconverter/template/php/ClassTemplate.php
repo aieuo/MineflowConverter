@@ -38,13 +38,25 @@ class ClassTemplate extends Template {
         $this->implements = $implements;
     }
 
+    public function addMethod(MethodTemplate $method): void {
+        $this->methods[] = $method;
+    }
+
     public function getLines(): array {
         $lines = [];
         $lines[] = "<?php";
         $lines[] = "";
         $lines[] = "namespace {$this->namespace};";
         $lines[] = "";
-        foreach ($this->uses as $use) {
+
+        $uses = $this->uses;
+        foreach ($this->methods as $method) {
+            foreach ($method->getUseClasses() as $class) {
+               $uses[] = $class;
+            }
+        }
+        $uses = array_unique($uses);
+        foreach ($uses as $use) {
             $lines[] = "use {$use};";
         }
         $lines[] = "";

@@ -11,8 +11,6 @@ abstract class Converter {
     private $owner;
     /* @var string */
     private $baseDir;
-    /** @var string[] */
-    private $templates = [];
 
     public function __construct(Main $owner, string $dir) {
         $this->owner = $owner;

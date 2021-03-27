@@ -20,6 +20,7 @@ use aieuo\mineflow\flowItem\action\string\EditString;
 use aieuo\mineflow\flowItem\action\string\StringLength;
 use aieuo\mineflow\flowItem\FlowItemContainer;
 use aieuo\mineflow\recipe\Recipe;
+use aieuo\mineflow\trigger\block\BlockTrigger;
 use aieuo\mineflow\variable\DummyVariable;
 use aieuo\mineflow\variable\NumberVariable;
 use aieuo\mineflow\variable\StringVariable;
@@ -45,6 +46,8 @@ class Main extends PluginBase {
             "str" => new StringVariable("100"),
         ];
         $recipe = new Recipe("aieuo");
+        $recipe->addTrigger(new BlockTrigger("1,1,2,world"));
+        $recipe->addTrigger(new BlockTrigger("1,2,2,world"));
         $recipe->addItem(new SendMessage("target", "hand"), FlowItemContainer::ACTION);
         $recipe->addItem(new SetItemLore("target", "aieuo1;aieuo2;aieuo3;1;233;;aieuo;{player}"), FlowItemContainer::ACTION);
         $recipe->addItem(new GetPlayerByName("target", "player"), FlowItemContainer::ACTION);
@@ -60,7 +63,7 @@ class Main extends PluginBase {
         $recipe->addItem(new FourArithmeticOperations("10", FourArithmeticOperations::ADDITION, "{x * (1 + 2}"), FlowItemContainer::ACTION);
         $recipe->addItem(new Calculate("123", Calculate::CALC_SIN), FlowItemContainer::ACTION);
         $recipe->addItem(new Calculate2("12", "23", Calculate2::CALC_ATAN2), FlowItemContainer::ACTION);
-        var_dump($converter->convert($recipe, $variables));
+        $converter->convert("aieuo\\test", $recipe, $variables);
     }
 
     public function onCommand(CommandSender $sender, Command $command, string $label, array $args): bool {
@@ -87,7 +90,7 @@ class Main extends PluginBase {
                             break;
                         }
                         $converter = new MineflowToPHP($this, "mf2php");
-                        $converter->convert($recipe);
+                        $converter->convert("aieuo\\test", $recipe);
                         break;
                 }
                 break;

@@ -6,6 +6,8 @@ use aieuo\mfconverter\exception\ConvertException;
 use aieuo\mfconverter\template\php\ClassTemplate;
 use aieuo\mfconverter\template\php\CodesTemplate;
 use aieuo\mfconverter\template\php\MethodTemplate;
+use aieuo\mineflow\exception\UndefinedMineflowPropertyException;
+use aieuo\mineflow\exception\UndefinedMineflowVariableException;
 use aieuo\mineflow\exception\UnsupportedCalculationException;
 use aieuo\mineflow\flowItem\action\block\CreateBlockVariable;
 use aieuo\mineflow\flowItem\action\command\Command;
@@ -83,6 +85,7 @@ use aieuo\mineflow\flowItem\action\script\ElseifAction;
 use aieuo\mineflow\flowItem\action\script\ExecuteRecipe;
 use aieuo\mineflow\flowItem\action\script\ExecuteRecipeWithEntity;
 use aieuo\mineflow\flowItem\action\script\ExitRecipe;
+use aieuo\mineflow\flowItem\action\script\ForeachPosition;
 use aieuo\mineflow\flowItem\action\script\IFAction;
 use aieuo\mineflow\flowItem\action\script\RepeatAction;
 use aieuo\mineflow\flowItem\action\script\SaveConfigFile;
@@ -138,25 +141,33 @@ use aieuo\mineflow\flowItem\condition\RemoveItemCondition;
 use aieuo\mineflow\flowItem\FlowItem;
 use aieuo\mineflow\Main as MineflowMain;
 use aieuo\mineflow\recipe\Recipe;
+use aieuo\mineflow\trigger\block\BlockTrigger;
 use aieuo\mineflow\variable\DefaultVariables;
 use aieuo\mineflow\variable\DummyVariable;
 use aieuo\mineflow\variable\ListVariable;
 use aieuo\mineflow\variable\MapVariable;
 use aieuo\mineflow\variable\NumberVariable;
+use aieuo\mineflow\variable\ObjectVariable;
 use aieuo\mineflow\variable\StringVariable;
 use aieuo\mineflow\variable\Variable;
+use pocketmine\block\BlockFactory;
 use pocketmine\entity\Effect;
 use pocketmine\entity\EffectInstance;
 use pocketmine\entity\Living;
 use pocketmine\event\Cancellable;
 use pocketmine\event\entity\EntityDamageEvent;
+use pocketmine\event\Listener;
+use pocketmine\event\player\PlayerInteractEvent;
 use pocketmine\item\enchantment\Enchantment;
 use pocketmine\item\enchantment\EnchantmentInstance;
 use pocketmine\item\Item;
 use pocketmine\item\ItemFactory;
+use pocketmine\level\Position;
 use pocketmine\math\Vector3;
 use pocketmine\network\mcpe\protocol\PlaySoundPacket;
+use pocketmine\network\mcpe\protocol\SpawnParticleEffectPacket;
 use pocketmine\Player;
+use pocketmine\plugin\PluginBase;
 use pocketmine\Server;
 
 class MineflowToPHP extends Converter {
@@ -165,7 +176,7 @@ class MineflowToPHP extends Converter {
     public const PARAM_INT = "(int)";
     public const PARAM_FLOAT = "(float)";
 
-    public function convert(Recipe $recipe, array $variables = null): string {
+    public function convert(string $namespace, Recipe $recipe, array $variables = null): void {
         $variables = $variables ?? $this->getVariables($recipe);
 
         $codes = [];
@@ -173,17 +184,87 @@ class MineflowToPHP extends Converter {
         foreach ($recipe->getActions() as $action) {
             try {
                 $codes = array_merge($codes, ["", "// ".$action->getName()], $this->convertAction($action, $variables, $uses));
-            } catch (ConvertException $e) {
+            } catch (ConvertException|UndefinedMineflowVariableException|UndefinedMineflowPropertyException|UnsupportedCalculationException $e) {
                 $this->getLogger()->error($e->getMessage());
-                return "";
+                return;
             }
         }
 
+        $recipeMethodName = "recipe1";
+
+        $hasEventListener = false;
+        $eventListener = $this->createEventListenerClass($namespace);
+
+        $blockTriggers = [];
+        foreach ($recipe->getTriggers() as $trigger) {
+            if ($trigger instanceof BlockTrigger) {
+                $blockTriggers[] = $trigger;
+                $hasEventListener = true;
+            } else {
+                $this->getLogger()->error("Unsupported trigger type: ".$trigger->getType());
+                return;
+            }
+        }
+        $args = [];
+        if (!empty($blockTriggers)) {
+            $args = ['Player $target', 'Block $block'];
+            $method = $this->createBlockTriggerMethod($blockTriggers, $recipeMethodName);
+            $eventListener->addMethod($method);
+        }
+
+        $main = $this->createMainClass($namespace, $hasEventListener);
+
         $uses = array_unique($uses);
         $codes = new CodesTemplate($codes);
-        $method = new MethodTemplate($recipe->getName(), [], $codes);
-        $class = new ClassTemplate("aieuo\\test", "Recipes", $uses, [$method]);
-        return $class->format();
+        $method = new MethodTemplate($recipeMethodName, $args, $codes, $uses, true);
+        $class = new ClassTemplate($namespace, "Recipes", [], [$method]);
+
+        var_dump($eventListener->format(), $main->format(), $class->format());
+    }
+
+    public function createMainClass(string $namespace, bool $hasEventListener): ClassTemplate {
+        $onEnable = new MethodTemplate("onEnable", [], new CodesTemplate([]));
+        if ($hasEventListener) {
+            $onEnable->addCode('Server::getInstance()->getPluginManager()->registerEvents(new EventListener(), $this);', [Server::class]);
+        }
+
+        return new ClassTemplate($namespace, "Main", [PluginBase::class], [$onEnable], "PluginBase");
+    }
+
+    public function createEventListenerClass(string $namespace): ClassTemplate {
+        $uses = [];
+        $uses[] = Listener::class;
+
+        return new ClassTemplate($namespace, "Main", $uses, [], null, ["Listener"]);
+    }
+
+    /**
+     * @param BlockTrigger[] $triggers
+     * @param string $target
+     * @return MethodTemplate
+     */
+    public function createBlockTriggerMethod(array $triggers, string $target): MethodTemplate {
+        $uses = [];
+        $uses[] = PlayerInteractEvent::class;
+        $codes = [];
+        $codes[] = $this->buildStatement('$event', "getPlayer", [], '$player');
+        $codes[] = $this->buildStatement('$event', "getBlock", [], '$block');
+        $codes[] = '$position = $block->x.",".$block->y.",".$block->z.",".$block->level->getFolderName();';
+        $codes[] = 'switch ($position) {';
+
+        foreach ($triggers as $trigger) {
+            $switch = [];
+            $case = [];
+            $switch[] = 'case "'.$trigger->getKey().'":';
+            $case[] = 'Recipes::'.$target.'($player, $block)';
+            $case[] = "break;";
+
+            $switch[] = $case;
+            $codes[] = $switch;
+        }
+
+        $codes[] = '}';
+        return new MethodTemplate("onBlockTrigger", ['PlayerInteractEvent $event'], new CodesTemplate($codes), $uses);
     }
 
     /**
@@ -267,8 +348,8 @@ class MineflowToPHP extends Converter {
                     return $this->convertContent($value, $variables);
                 }, $action->getPosition());
                 $tmpVariable = $this->getNotDuplicatedVariable("amount", $variables);
-
                 $variables[$tmpVariable] = new DummyVariable(DummyVariable::DUMMY, $tmpVariable);
+
                 return [
                     $this->buildStatement("new", "Vector3", [
                         [$positions[0], self::PARAM_FLOAT],
@@ -493,11 +574,11 @@ class MineflowToPHP extends Converter {
                 return [$this->buildStatement($targetPlayer, "getInventory()->getContents()", [], "$".$resultName)];
             case $action instanceof GetPi:
                 $resultName = $this->convertContent($action->getResultName(), $variables, true);
-                $variables[$action->getResultName()] = new NumberVariable(M_PI);
+                $variables[$action->getResultName()] = new DummyVariable(DummyVariable::NUMBER);
                 return ["$".$resultName." = M_PI;"];
             case $action instanceof GetE:
                 $resultName = $this->convertContent($action->getResultName(), $variables, true);
-                $variables[$action->getResultName()] = new NumberVariable(M_PI);
+                $variables[$action->getResultName()] = new DummyVariable(DummyVariable::NUMBER);
                 return ["$".$resultName." = M_E;"];
             case $action instanceof GenerateRandomNumber:
                 $resultName = $this->convertContent($action->getResultName(), $variables, true);
@@ -656,6 +737,117 @@ class MineflowToPHP extends Converter {
                         break;
                 }
                 return $codes;
+            case $action instanceof CreatePositionVariable:
+                $resultName = $this->convertContent($action->getVariableName(), $variables, true);
+                $x = $this->convertContent($action->getX(), $variables);
+                $y = $this->convertContent($action->getY(), $variables);
+                $z = $this->convertContent($action->getZ(), $variables);
+                $levelName = $this->convertContent($action->getLevel(), $variables);
+
+                $uses[] = Position::class;
+                $variables[$action->getVariableName()] = new DummyVariable(DummyVariable::POSITION);
+                return [$this->buildStatement("new", "Position", [
+                    [$x, self::PARAM_FLOAT],
+                    [$y, self::PARAM_FLOAT],
+                    [$z, self::PARAM_FLOAT],
+                    [$levelName, self::PARAM_STRING],
+                ], '$'.$resultName, " ")];
+            case $action instanceof CreateBlockVariable:
+                $resultName = $this->convertContent($action->getVariableName(), $variables, true);
+                $id = $this->convertContent($action->getBlockId(), $variables);
+
+                $codes = [];
+                if (preg_match("/(\d+):?(\d*)/", $id, $matches)) {
+                    $uses[] = BlockFactory::class;
+                    $codes[] = '$'.$resultName.' = BlockFactory::get('.$matches[1].', '.(empty($matches[2]) ? 0 : $matches[2]).');';
+                } else {
+                    $tmpVariable = $this->getNotDuplicatedVariable("item", $variables);
+                    $variables[$tmpVariable] = new DummyVariable(DummyVariable::ITEM);
+
+                    $uses[] = ItemFactory::class;
+                    $codes[] = '$'.$tmpVariable.' = ItemFactory::fromString('.$id.');';
+                    $codes[] = $this->buildStatement('$'.$resultName, "getBlock", [], '$'.$tmpVariable);
+                }
+
+                $variables[$action->getVariableName()] = new DummyVariable(DummyVariable::BLOCK);
+                return $codes;
+            case $action instanceof ForeachPosition:
+                $pos1 = $this->getTargetVariable($action->getPositionVariableName("pos1"), $variables);
+                $pos2 = $this->getTargetVariable($action->getPositionVariableName("pos2"), $variables);
+
+                $variables[$sx = $this->getNotDuplicatedVariable("sx", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$sy = $this->getNotDuplicatedVariable("sy", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$sz = $this->getNotDuplicatedVariable("sz", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$ex = $this->getNotDuplicatedVariable("ex", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$ey = $this->getNotDuplicatedVariable("ey", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$ez = $this->getNotDuplicatedVariable("ez", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$x = $this->getNotDuplicatedVariable("x", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$y = $this->getNotDuplicatedVariable("y", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+                $variables[$z = $this->getNotDuplicatedVariable("z", $variables)] = new DummyVariable(DummyVariable::NUMBER);
+
+                $tmpVariable = $this->getNotDuplicatedVariable("pos", $variables);
+                $variables[$tmpVariable] = new DummyVariable(DummyVariable::POSITION);
+                $uses[] = Position::class;
+
+                $insides = [$this->buildStatement("new", "Position", ["$".$x, "$".$y, "$".$z, $pos1."->getLevel()"], "$".$tmpVariable, " ")];
+                foreach ($action->getActions() as $item) {
+                    foreach ($this->convertAction($item, $variables, $uses) as $line) {
+                        $insides[] = $line;
+                    }
+                }
+
+                $codes = [
+                    $this->buildStatement("", "min", [$pos1."->x", $pos2."->x"], "$".$sx, ""),
+                    $this->buildStatement("", "min", [$pos1."->y", $pos2."->y"], "$".$sy, ""),
+                    $this->buildStatement("", "min", [$pos1."->z", $pos2."->z"], "$".$sz, ""),
+                    $this->buildStatement("", "max", [$pos1."->x", $pos2."->x"], "$".$ex, ""),
+                    $this->buildStatement("", "max", [$pos1."->y", $pos2."->y"], "$".$ey, ""),
+                    $this->buildStatement("", "max", [$pos1."->z", $pos2."->z"], "$".$ez, ""),
+                    'for ($'.$x.' = $'.$sx.'; $'.$x.' <= $'.$ex.'; $'.$x.'++) {', [
+                        'for ($'.$y.' = $'.$sy.'; $'.$y.' <= $'.$ey.'; $'.$y.'++) {', [
+                            'for ($'.$z.' = $'.$sz.'; $'.$z.' <= $'.$ez.'; $'.$z.'++) {',
+                                $insides,
+                            "}",
+                        ], "}",
+                    ], "}",
+                ];
+                return $codes;
+            case $action instanceof SetBlock:
+                $position = $this->getTargetVariable($action->getPositionVariableName(), $variables);
+                $block = $this->getTargetVariable($action->getBlockVariableName(), $variables);
+                return [
+                    $this->buildStatement($position."->level", "setBlock", [$position, $block])
+                ];
+            case $action instanceof AddParticle:
+                $position = $this->getTargetVariable($action->getPositionVariableName(), $variables);
+                $particleName = $this->convertContent($action->getParticle(), $variables);
+                $amount = $this->convertContent($action->getAmount(), $variables);
+
+                $uses[] = SpawnParticleEffectPacket::class;
+                $uses[] = Server::class;
+
+                $tmpVariable = $this->getNotDuplicatedVariable("pk", $variables);
+                $variables[$tmpVariable] = new DummyVariable(DummyVariable::UNKNOWN, $tmpVariable);
+                $particleCode = [
+                    '$'.$tmpVariable.' = new SpawnParticleEffectPacket();',
+                    '$'.$tmpVariable.'->position = '.$position.';',
+                    '$'.$tmpVariable.'->particleName = '.$particleName.';',
+                    $this->buildStatement('Server::getInstance()', "broadcastPacket", [
+                        $this->buildStatement($position."->level", "getPlayers", [], null, "->", false),
+                        '$'.$tmpVariable
+                    ]),
+                ];
+                if ($amount === "1") {
+                    return $particleCode;
+                }
+
+                $tmpVariable = $this->getNotDuplicatedVariable("i", $variables);
+                $variables[$tmpVariable] = new DummyVariable(DummyVariable::UNKNOWN, $tmpVariable);
+                return [
+                    'for ($'.$tmpVariable.' = 0; $'.$tmpVariable.' < '.$this->castValue($amount, self::PARAM_INT).'; $'.$tmpVariable.'++) {',
+                    $particleCode,
+                    '}'
+                ];
             case $action instanceof IFAction:
             case $action instanceof ElseifAction:
             case $action instanceof ElseAction:
@@ -676,7 +868,6 @@ class MineflowToPHP extends Converter {
             case $action instanceof CreateMapVariable:
             case $action instanceof AddMapVariable:
             case $action instanceof DeleteListVariableContent:
-            case $action instanceof CreatePositionVariable:
             case $action instanceof GetVariableNested:
             case $action instanceof CountListVariable:
             case $action instanceof JoinListVariableToString:
@@ -685,10 +876,7 @@ class MineflowToPHP extends Converter {
             case $action instanceof SendMenuForm:
             case $action instanceof Command:
             case $action instanceof CommandConsole:
-            case $action instanceof CreateBlockVariable:
-            case $action instanceof SetBlock:
             case $action instanceof GetBlock:
-            case $action instanceof AddParticle:
             case $action instanceof PlaySoundAt:
             case $action instanceof CreateScoreboardVariable:
             case $action instanceof SetScoreboardScore:
@@ -1072,11 +1260,15 @@ class MineflowToPHP extends Converter {
         return ($assign === null ? "" : ($assign." = ")).
             $class.$separator.$method."(".implode(", ", array_map(function ($arg) {
                 if (!is_array($arg)) return $arg;
-                if ($arg[1] === self::PARAM_STRING) return $arg[0];
-
-                if (preg_match("/\"(-?\d+.?\d*)\"/", $arg[0], $matches)) $arg[0] = $matches[1];
-                return is_numeric($arg[0]) ? $arg[0] : ($arg[1].(strpos($arg[0], ".") !== false ? ("(".$arg[0].")") : $arg[0]));
+                return $this->castValue($arg[0], $arg[1]);
             }, $args)).")".($semicolon ? ";" : "");
+    }
+
+    private function castValue(string $value, string $type): string {
+        if ($type === self::PARAM_STRING) return $value;
+
+        if (preg_match("/\"(-?\d+.?\d*)\"/", $value, $matches)) $value = $matches[1];
+        return is_numeric($value) ? $value : ($type.(strpos($value, ".") !== false ? ("(".$value.")") : $value));
     }
 
     private function getNotDuplicatedVariable(string $name, array $variables): string {
