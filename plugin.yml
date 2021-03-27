@@ -1,0 +1,15 @@
+---
+name: MineflowConverter
+main: aieuo\mfconverter\Main
+version: 0.1.0
+api: 3.0.0
+load: POSTWORLD
+depend:
+  - Mineflow
+author: aieuo
+commands:
+  mfconvert:
+    description: Mineflowの変換
+    usage: /mfconvert <from> <to>
+    permission: op
+...
